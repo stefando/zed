@@ -221,6 +221,17 @@ fn main() {
     util::prevent_root_execution();
 
     let args = Args::parse();
+    #[cfg(target_os = "macos")]
+    let args = {
+        let mut args = args;
+        args.user_data_dir.get_or_insert_with(|| {
+            paths::home_dir()
+                .join("Library/Application Support/Zed Dev")
+                .to_string_lossy()
+                .into_owned()
+        });
+        args
+    };
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
@@ -2180,7 +2191,7 @@ struct Args {
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     ///
     /// This overrides the default platform-specific data directory location.
-    /// On macOS, the default is `~/Library/Application Support/Zed`.
+    /// On macOS, the default is `~/Library/Application Support/Zed Dev`.
     /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
     /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
     #[arg(long, value_name = "DIR", verbatim_doc_comment)]

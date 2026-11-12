@@ -133,6 +133,40 @@ pub fn select_popover(
     })
 }
 
+/// Selects branch refs without checking them out, reporting the full selection after each toggle.
+pub fn select_multiple_popover(
+    workspace: WeakEntity<Workspace>,
+    repository: Option<Entity<Repository>>,
+    selected_branches: Vec<SharedString>,
+    on_select: SelectBranchesCallback,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<BranchList> {
+    cx.new(|cx| {
+        let mut list = BranchList::new_inner_with_behavior(
+            workspace,
+            repository,
+            BranchListStyle::Popover,
+            rems(20.),
+            false,
+            BranchSelectionBehavior::SelectMultiple {
+                selected_branches,
+                on_select,
+            },
+            window,
+            cx,
+        );
+        list._subscriptions
+            .push(cx.subscribe(&list.picker, |this, _, _, cx| {
+                if !this.branch_filter_menu_open(cx) {
+                    cx.emit(DismissEvent);
+                }
+            }));
+        list.focus_handle(cx).focus(window, cx);
+        list
+    })
+}
+
 pub fn select_modal(
     workspace: WeakEntity<Workspace>,
     repository: Option<Entity<Repository>>,
@@ -188,6 +222,7 @@ pub fn select_embedded(
 }
 
 pub type SelectBranchCallback = Arc<dyn Fn(Branch, &mut Window, &mut App)>;
+pub type SelectBranchesCallback = Arc<dyn Fn(Vec<SharedString>, &mut Window, &mut App)>;
 
 pub fn create_embedded(
     workspace: WeakEntity<Workspace>,
@@ -719,6 +754,10 @@ enum BranchSelectionBehavior {
         selected_branch: Option<SharedString>,
         on_select: SelectBranchCallback,
     },
+    SelectMultiple {
+        selected_branches: Vec<SharedString>,
+        on_select: SelectBranchesCallback,
+    },
 }
 
 impl BranchSelectionBehavior {
@@ -728,11 +767,30 @@ impl BranchSelectionBehavior {
             Self::Select {
                 selected_branch, ..
             } => selected_branch.as_ref(),
+            Self::SelectMultiple {
+                selected_branches, ..
+            } => selected_branches.first(),
         }
     }
 
     fn is_select_only(&self) -> bool {
-        matches!(self, Self::Select { .. })
+        matches!(self, Self::Select { .. } | Self::SelectMultiple { .. })
+    }
+
+    fn is_branch_selected(&self, branch: &Branch) -> bool {
+        match self {
+            Self::Checkout => false,
+            Self::Select {
+                selected_branch, ..
+            } => selected_branch
+                .as_ref()
+                .is_some_and(|selected| branch_matches_ref(branch, selected)),
+            Self::SelectMultiple {
+                selected_branches, ..
+            } => selected_branches
+                .iter()
+                .any(|selected| branch_matches_ref(branch, selected)),
+        }
     }
 }
 
@@ -947,6 +1005,19 @@ fn branch_matches_ref(branch: &Branch, branch_ref: &SharedString) -> bool {
     branch.ref_name.as_ref() == branch_ref.as_ref() || branch.name() == branch_ref.as_ref()
 }
 
+fn toggle_selected_branch(selected_branches: &mut Vec<SharedString>, branch: &Branch) {
+    if selected_branches
+        .iter()
+        .any(|selected| branch_matches_ref(branch, selected))
+    {
+        selected_branches.retain(|selected| !branch_matches_ref(branch, selected));
+    } else {
+        selected_branches.push(branch.ref_name.clone());
+    }
+    selected_branches.sort_unstable();
+    selected_branches.dedup();
+}
+
 fn branch_remote_name(branch: &Branch) -> Option<&str> {
     branch.remote_name().or_else(|| {
         branch
@@ -1028,12 +1099,7 @@ impl BranchListDelegate {
         branch_selection_behavior: BranchSelectionBehavior,
         cx: &mut Context<BranchList>,
     ) -> Self {
-        let restore_selected_branch = match &branch_selection_behavior {
-            BranchSelectionBehavior::Checkout => None,
-            BranchSelectionBehavior::Select {
-                selected_branch, ..
-            } => selected_branch.clone(),
-        };
+        let restore_selected_branch = branch_selection_behavior.selected_branch().cloned();
         let branch_filter = cx
             .try_global::<GlobalBranchFilter>()
             .map_or(BranchFilter::All, |filter| filter.0);
@@ -1585,6 +1651,17 @@ impl PickerDelegate for BranchListDelegate {
 
         match entry {
             Entry::Branch { branch, .. } => {
+                if let BranchSelectionBehavior::SelectMultiple {
+                    selected_branches,
+                    on_select,
+                } = &mut self.branch_selection_behavior
+                {
+                    toggle_selected_branch(selected_branches, branch);
+                    on_select(selected_branches.clone(), window, cx);
+                    cx.notify();
+                    return;
+                }
+
                 if let BranchSelectionBehavior::Select { on_select, .. } =
                     &self.branch_selection_behavior
                 {
@@ -1701,9 +1778,7 @@ impl PickerDelegate for BranchListDelegate {
         let is_head_branch = entry.as_branch().is_some_and(|branch| branch.is_head);
         let is_checked_branch = entry.as_branch().is_some_and(|branch| {
             if self.is_select_only() {
-                self.branch_selection_behavior
-                    .selected_branch()
-                    .is_some_and(|selected_branch| branch_matches_ref(branch, selected_branch))
+                self.branch_selection_behavior.is_branch_selected(branch)
             } else {
                 branch.is_head
             }
@@ -2200,6 +2275,27 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_multiple_branch_selection_uses_full_refs() {
+        let local = create_test_branch("main", true, None, Some(1000));
+        let remote = create_test_branch("main", false, Some("origin"), Some(900));
+        let mut selected = vec!["main".into()];
+        toggle_selected_branch(&mut selected, &local);
+        assert!(selected.is_empty());
+        toggle_selected_branch(&mut selected, &remote);
+        toggle_selected_branch(&mut selected, &local);
+        assert_eq!(
+            selected,
+            vec![local.ref_name.clone(), remote.ref_name.clone()]
+        );
+        let behavior = BranchSelectionBehavior::SelectMultiple {
+            selected_branches: selected,
+            on_select: Arc::new(|_, _, _| {}),
+        };
+        assert!(behavior.is_branch_selected(&local));
+        assert!(behavior.is_branch_selected(&remote));
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -3109,6 +3205,80 @@ mod tests {
         assert!(BranchFilter::All.next() == BranchFilter::Local);
         assert!(BranchFilter::Local.next() == BranchFilter::Remote);
         assert!(BranchFilter::Remote.next() == BranchFilter::All);
+    }
+
+    #[gpui::test]
+    async fn test_multi_select_picker_toggles_without_checkout(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (project, repository) = init_fake_repository(cx).await;
+        cx.run_until_parked();
+        repository.update(cx, |repository, cx| {
+            repository.set_branch_list_for_test(
+                vec![
+                    create_test_branch("main", true, None, Some(1000)),
+                    create_test_branch("feature", false, None, Some(900)),
+                ],
+                cx,
+            );
+        });
+        let original_branch = repository.read_with(cx, |repository, _| repository.branch.clone());
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi, _| multi.workspace().downgrade())
+            .expect("workspace");
+        let selections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let list = window
+            .update(cx, |_, window, cx| {
+                select_multiple_popover(
+                    workspace,
+                    Some(repository.clone()),
+                    Vec::new(),
+                    Arc::new({
+                        let selections = selections.clone();
+                        move |branches, _, _| {
+                            selections.lock().expect("selections lock").push(branches)
+                        }
+                    }),
+                    window,
+                    cx,
+                )
+            })
+            .expect("branch picker");
+        let mut context = VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut context;
+        update_branch_list_matches_with_empty_query(&list, cx).await;
+        for branch in ["main", "feature", "main", "feature"] {
+            list.update_in(cx, |list, window, cx| {
+                list.picker.update(cx, |picker, cx| {
+                    picker.delegate.selected_index = picker
+                        .delegate
+                        .matches
+                        .iter()
+                        .position(|entry| entry.name() == branch)
+                        .expect("branch entry");
+                    picker.delegate.confirm(false, window, cx);
+                });
+            });
+        }
+        assert_eq!(
+            *selections.lock().expect("selections lock"),
+            vec![
+                vec![SharedString::from("refs/heads/main")],
+                vec![
+                    SharedString::from("refs/heads/feature"),
+                    "refs/heads/main".into()
+                ],
+                vec![SharedString::from("refs/heads/feature")],
+                Vec::new(),
+            ]
+        );
+        assert_eq!(
+            repository.read_with(cx, |repository, _| repository
+                .branch
+                .as_ref()
+                .map(|branch| branch.ref_name.clone())),
+            original_branch.map(|branch| branch.ref_name)
+        );
     }
 
     #[gpui::test]

@@ -87,7 +87,7 @@ struct Args {
     classic: bool,
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     /// This overrides the default platform-specific data directory location:
-    #[cfg_attr(target_os = "macos", doc = "`~/Library/Application Support/Zed`.")]
+    #[cfg_attr(target_os = "macos", doc = "`~/Library/Application Support/Zed Dev`.")]
     #[cfg_attr(target_os = "windows", doc = "`%LOCALAPPDATA%\\Zed`.")]
     #[cfg_attr(
         not(any(target_os = "windows", target_os = "macos")),
@@ -468,6 +468,17 @@ fn run() -> Result<()> {
     }
 
     let args = Args::parse();
+    #[cfg(target_os = "macos")]
+    let args = {
+        let mut args = args;
+        args.user_data_dir.get_or_insert_with(|| {
+            paths::home_dir()
+                .join("Library/Application Support/Zed Dev")
+                .to_string_lossy()
+                .into_owned()
+        });
+        args
+    };
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     if let Some(socket) = &args.askpass {

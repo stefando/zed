@@ -1,5 +1,6 @@
 pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
 use crate::{
+    branch_picker,
     commit_context_menu::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
         commit_context_menu, git_context_menu_tasks, git_task_context,
@@ -58,10 +59,11 @@ use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, DiffStat,
     Disclosure, Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem,
-    ListItemSpacing, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
-    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+    ListItemSpacing, PopoverMenu, RedistributableColumnsState, ScrollableHandle, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
+    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -1491,6 +1493,20 @@ pub struct GitGraph {
 }
 
 impl GitGraph {
+    fn set_log_source(&mut self, source: LogSource, cx: &mut Context<Self>) {
+        if self.log_source == source {
+            return;
+        }
+        self.log_source = source;
+        self.selected_entry_idx = None;
+        self.hovered_entry_idx = None;
+        self.pending_select_sha = None;
+        self.table_interaction_state
+            .read(cx)
+            .set_scroll_offset(point(px(0.), px(0.)));
+        self.invalidate_state(cx);
+    }
+
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         if self.pending_select_sha.is_none() {
             self.pending_select_sha = self.selected_commit_sha;
@@ -2917,8 +2933,75 @@ impl GitGraph {
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
+    fn render_branch_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let repository = self.get_repository(cx);
+        let selected_branches = match &self.log_source {
+            LogSource::Branch(branch) => vec![branch.clone()],
+            LogSource::Branches(branches) => branches.clone(),
+            _ => Vec::new(),
+        };
+        let label: SharedString = match selected_branches.as_slice() {
+            [] => "All Branches".into(),
+            [branch] => branch
+                .strip_prefix("refs/heads/")
+                .or_else(|| branch.strip_prefix("refs/remotes/"))
+                .unwrap_or(branch)
+                .to_owned()
+                .into(),
+            branches => format!("{} Branches", branches.len()).into(),
+        };
+        let workspace = self.workspace.clone();
+        let graph = cx.weak_entity();
+        let has_filter = !selected_branches.is_empty();
+
+        h_flex()
+            .gap_1()
+            .child(
+                PopoverMenu::new("git-graph-branch-filter")
+                    .menu(move |window, cx| {
+                        let graph = graph.clone();
+                        let on_select =
+                            Arc::new(move |branches, _window: &mut Window, cx: &mut App| {
+                                graph
+                                    .update(cx, |graph, cx| {
+                                        graph.set_log_source(LogSource::branches(branches), cx);
+                                    })
+                                    .log_err();
+                            });
+                        Some(branch_picker::select_multiple_popover(
+                            workspace.clone(),
+                            repository.clone(),
+                            selected_branches.clone(),
+                            on_select,
+                            window,
+                            cx,
+                        ))
+                    })
+                    .trigger_with_tooltip(
+                        Button::new("git-graph-branch-filter-trigger", label)
+                            .end_icon(Icon::new(IconName::ChevronDown)),
+                        Tooltip::text("Filter by Branch"),
+                    ),
+            )
+            .when(has_filter, |this| {
+                this.child(
+                    IconButton::new("git-graph-branch-filter-clear", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Show All Branches"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_log_source(LogSource::All, cx);
+                        })),
+                )
+            })
+    }
+
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let color = cx.theme().colors();
+        let border_color = cx.theme().colors().border_variant;
+        let toolbar_background = cx.theme().colors().toolbar_background;
+        let show_branch_filter = matches!(
+            self.log_source,
+            LogSource::All | LogSource::Branch(_) | LogSource::Branches(_)
+        ) && self.get_repository(cx).is_some();
         let query_focus_handle = self
             .search_state
             .editor
@@ -2935,7 +3018,7 @@ impl GitGraph {
             .p_1p5()
             .gap_1p5()
             .border_b_1()
-            .border_color(color.border_variant)
+            .border_color(border_color)
             .child(
                 h_flex()
                     .h_8()
@@ -2945,9 +3028,9 @@ impl GitGraph {
                     .gap_1()
                     .track_focus(&query_focus_handle)
                     .border_1()
-                    .border_color(color.border_variant)
+                    .border_color(border_color)
                     .rounded_md()
-                    .bg(color.toolbar_background)
+                    .bg(toolbar_background)
                     .on_action(cx.listener(Self::confirm_search))
                     .child(self.search_state.editor.clone())
                     .child({
@@ -3058,6 +3141,9 @@ impl GitGraph {
                             ),
                     ),
             )
+            .when(show_branch_filter, |this| {
+                this.child(self.render_branch_filter(cx))
+            })
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
@@ -5094,6 +5180,7 @@ mod persistence {
         Oid,
         repository::{LogOrder, LogSource, RepoPath},
     };
+    use util::ResultExt;
     use workspace::WorkspaceDb;
 
     pub struct GitGraphsDb(ThreadSafeConnection);
@@ -5136,6 +5223,7 @@ mod persistence {
     pub const LOG_SOURCE_BRANCH: i32 = 1;
     pub const LOG_SOURCE_SHA: i32 = 2;
     pub const LOG_SOURCE_PATH: i32 = 3;
+    pub const LOG_SOURCE_BRANCHES: i32 = 4;
 
     pub const LOG_ORDER_DATE: i32 = 0;
     pub const LOG_ORDER_TOPO: i32 = 1;
@@ -5146,6 +5234,7 @@ mod persistence {
         match log_source {
             LogSource::All => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
+            LogSource::Branches(_) => LOG_SOURCE_BRANCHES,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
         }
@@ -5155,6 +5244,7 @@ mod persistence {
         match log_source {
             LogSource::All => None,
             LogSource::Branch(branch) => Some(branch.to_string()),
+            LogSource::Branches(branches) => serde_json::to_string(branches).log_err(),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
         }
@@ -5176,6 +5266,12 @@ mod persistence {
                 .log_source_value
                 .as_ref()
                 .map(|v| LogSource::Branch(v.clone().into()))
+                .unwrap_or_default(),
+            Some(LOG_SOURCE_BRANCHES) => state
+                .log_source_value
+                .as_ref()
+                .and_then(|value| serde_json::from_str(value).log_err())
+                .map(LogSource::branches)
                 .unwrap_or_default(),
             Some(LOG_SOURCE_SHA) => state
                 .log_source_value
@@ -6134,6 +6230,67 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_branch_filter_resets_selection_and_reloads_cached_graph(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({".git": {}, "file.txt": "content"}),
+        )
+        .await;
+        let mut rng = StdRng::seed_from_u64(42);
+        let commits = generate_random_commit_dag(&mut rng, 10, false);
+        fs.set_graph_commits(Path::new("/project/.git"), commits.clone());
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        graph.update(cx, |graph, cx| {
+            graph.commit_count_and_loading_state(cx);
+            assert_eq!(graph.graph_data.commits.len(), commits.len());
+            graph.selected_entry_idx = Some(4);
+            graph.pending_select_sha = Some(commits[4].sha);
+            graph.search_state.matches.insert(commits[4].sha);
+            graph.search_state.state = QueryState::Confirmed(("query".into(), Task::ready(())));
+            graph
+                .table_interaction_state
+                .read(cx)
+                .set_scroll_offset(point(px(0.), px(-200.)));
+            graph.set_log_source(LogSource::Branch("refs/heads/main".into()), cx);
+            assert!(graph.selected_entry_idx.is_none());
+            assert!(graph.pending_select_sha.is_none());
+            assert!(graph.search_state.matches.is_empty());
+            assert!(
+                matches!(&graph.search_state.state, QueryState::Pending(query) if query == "query")
+            );
+            assert_eq!(
+                graph.table_interaction_state.read(cx).scroll_offset(),
+                point(px(0.), px(0.))
+            );
+            assert!(graph.graph_data.commits.is_empty());
+            graph.set_log_source(LogSource::All, cx);
+            graph.commit_count_and_loading_state(cx);
+            assert_eq!(graph.graph_data.commits.len(), commits.len());
+        });
+    }
+
+    #[gpui::test]
     async fn test_initial_graph_data_not_cleared_on_initial_loading(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -7013,6 +7170,31 @@ mod tests {
             persistence::deserialize_log_source(&branch_state),
             LogSource::Branch("refs/heads/main".into())
         );
+
+        let multiple =
+            LogSource::branches(vec!["refs/heads/main".into(), "refs/heads/feature".into()]);
+        let multiple_state = SerializedGitGraphState {
+            log_source_type: Some(persistence::serialize_log_source_type(&multiple)),
+            log_source_value: persistence::serialize_log_source_value(&multiple),
+            ..Default::default()
+        };
+        assert_eq!(
+            persistence::deserialize_log_source(&multiple_state),
+            multiple
+        );
+        for value in ["[]", "[\"refs/heads/main\",\"refs/heads/main\"]"] {
+            let state = SerializedGitGraphState {
+                log_source_type: Some(persistence::LOG_SOURCE_BRANCHES),
+                log_source_value: Some(value.to_owned()),
+                ..Default::default()
+            };
+            let expected = if value == "[]" {
+                LogSource::All
+            } else {
+                LogSource::Branch("refs/heads/main".into())
+            };
+            assert_eq!(persistence::deserialize_log_source(&state), expected);
+        }
 
         let sha_state = SerializedGitGraphState {
             log_source_type: Some(persistence::LOG_SOURCE_SHA),

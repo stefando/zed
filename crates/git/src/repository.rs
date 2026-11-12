@@ -728,11 +728,24 @@ pub enum LogSource {
     #[default]
     All,
     Branch(SharedString),
+    /// Commits reachable from any of the selected branch refs, including merged ancestors.
+    Branches(Vec<SharedString>),
     Sha(Oid),
     Path(RepoPath),
 }
 
 impl LogSource {
+    /// Normalizes selection order and duplicates, using all refs when the selection is empty.
+    pub fn branches(mut branches: Vec<SharedString>) -> Self {
+        branches.sort_unstable();
+        branches.dedup();
+        match branches.len() {
+            0 => Self::All,
+            1 => Self::Branch(branches.remove(0)),
+            _ => Self::Branches(branches),
+        }
+    }
+
     fn get_args(&self) -> Vec<Cow<'_, str>> {
         let mut args = match self {
             LogSource::All => vec![
@@ -743,6 +756,10 @@ impl LogSource {
                 Cow::Borrowed("HEAD"),
             ],
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
+            LogSource::Branches(branches) => branches
+                .iter()
+                .map(|branch| Cow::Borrowed(branch.as_str()))
+                .collect(),
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
             LogSource::Path(path) => vec![
                 Cow::Borrowed("--follow"),
@@ -5315,6 +5332,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_branch_log_source_normalization() {
+        assert_eq!(LogSource::branches(vec![]), LogSource::All);
+        assert_eq!(
+            LogSource::branches(vec!["refs/heads/main".into(), "refs/heads/main".into()]),
+            LogSource::Branch("refs/heads/main".into())
+        );
+        let source = LogSource::branches(vec![
+            "refs/heads/main".into(),
+            "refs/heads/feature".into(),
+            "refs/heads/main".into(),
+        ]);
+        assert_eq!(
+            source.get_args(),
+            ["refs/heads/feature", "refs/heads/main", "--"]
+        );
+    }
+
     #[gpui::test]
     async fn test_initial_graph_data_accepts_sha_log_source(cx: &mut TestAppContext) {
         disable_git_global_config();
@@ -6824,6 +6859,63 @@ mod tests {
         let graph = graph_commits().await;
         assert!(graph.contains(&branch_sha));
         assert!(graph.contains(&hidden_sha));
+    }
+
+    #[gpui::test]
+    async fn test_initial_graph_data_filters_multiple_branches(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("create repository directory");
+        let path = directory.path();
+        git_init_repo(path);
+        git_command(path, ["commit", "--allow-empty", "-m", "base"]);
+        let base: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("base commit");
+        git_command(path, ["branch", "base"]);
+        let mut tips = Vec::new();
+        for branch in ["first", "second", "excluded"] {
+            git_command(path, ["checkout", "-b", branch, "base"]);
+            git_command(path, ["commit", "--allow-empty", "-m", "matching message"]);
+            tips.push(
+                git_command_output(path, ["rev-parse", "HEAD"])
+                    .parse::<Oid>()
+                    .expect("branch commit"),
+            );
+        }
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("open repository");
+        let source =
+            LogSource::branches(vec!["refs/heads/first".into(), "refs/heads/second".into()]);
+        let (sender, receiver) = smol::channel::unbounded();
+        repository
+            .initial_graph_data(source.clone(), LogOrder::DateOrder, sender)
+            .await
+            .expect("load filtered graph");
+        let mut commits = std::collections::HashSet::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            commits.extend(chunk.into_iter().map(|commit| commit.sha));
+        }
+        assert_eq!(commits, [base, tips[0], tips[1]].into_iter().collect());
+
+        let (sender, receiver) = smol::channel::unbounded();
+        repository
+            .search_commits(
+                source,
+                SearchCommitArgs {
+                    query: "matching message".into(),
+                    case_sensitive: false,
+                },
+                sender,
+            )
+            .await
+            .expect("search filtered graph");
+        let mut matches = std::collections::HashSet::new();
+        while let Ok(commit) = receiver.try_recv() {
+            matches.insert(commit);
+        }
+        assert_eq!(matches, [tips[0], tips[1]].into_iter().collect());
     }
 
     #[gpui::test]
