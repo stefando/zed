@@ -1,3 +1,15 @@
+# Rust development
+
+- Follow existing Rust conventions and workspace structure.
+- Prefer idiomatic Rust and standard library APIs.
+- Avoid unnecessary cloning and allocations.
+- Do not introduce unsafe code without justification.
+- Prefer explicit error propagation over `unwrap()`.
+- Use rust-analyzer MCP for semantic code navigation when available in the session.
+- After changes, run `cargo fmt` and `./script/clippy` for the affected crates.
+- Run affected tests with `cargo nextest`.
+- Do not modify public APIs without documenting the change.
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
